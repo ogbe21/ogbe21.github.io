@@ -1,0 +1,136 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include "HLK-LD2410S.h"
+
+// ====== Configuración ======
+const uint8_t MAC_MASTER[] = {0xB0, 0xCB, 0xD8, 0xC2, 0x42, 0x80};
+
+constexpr int RX_PIN = 16;
+constexpr int TX_PIN = 17;
+constexpr int OUTPUT_PIN = 4;        // Pin para LED / Relé
+
+LD2410S ld2410s(Serial1, RX_PIN, TX_PIN);
+
+typedef struct struct_message {
+  int id;
+  bool presencia;
+  int distancia;
+} struct_message;
+
+struct_message myData;
+
+// Variables de timing
+unsigned long lastSendTime = 0;
+unsigned long lastPresenceTime = 0;
+
+const unsigned long SEND_INTERVAL = 400;
+const unsigned long PRESENCE_HOLD_TIME = 8000;   // 8 segundos de hold (ajusta)
+
+bool previousPresencia = false;
+int previousDistancia = -1;
+
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  Serial.print("Envío: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "OK" : "Fallo");
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n=== NODO1 HLK-LD2410S + Luces (Optimizado) ===");
+
+  pinMode(OUTPUT_PIN, OUTPUT);
+  digitalWrite(OUTPUT_PIN, LOW);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+
+  ld2410s.begin();
+  delay(2000);
+
+  // === Configuración del sensor (IMPORTANTE) ===
+  Serial.println("Configurando parámetros del LD2410S...");
+
+  // Leer parámetros actuales
+  uint32_t farDist = 0, nearDist = 0, delayT = 0, freqSt = 0, freqDist = 0, respTime = 0;
+  if (ld2410s.readCommonParametersCommand(farDist, nearDist, delayT, freqSt, freqDist, respTime)) {
+    Serial.printf("Parámetros actuales -> Delay: %d s | Resp: %d | FreqStatus: %d | FreqDist: %d\n",
+                  delayT, respTime, freqSt, freqDist);
+  }
+
+  // Configurar para respuesta más rápida (valores seguros basados en la librería y manual)
+  // Reducimos el delay de "ausencia" y aumentamos la frecuencia de reporte
+  bool configOK = ld2410s.setCommonParametersCommand(
+    600,      // farDistance (cm) - hasta 6 metros aprox
+    20,       // nearDistance (cm)
+    3,        // delayTime (segundos) - ¡MUY importante! antes estaba alto
+    2,        // freqStatus
+    4,        // freqDistance
+    1         // responseTime = 1 (Fast)
+  );
+
+  if (configOK) {
+    Serial.println("✅ Parámetros configurados correctamente (respuesta rápida)");
+  } else {
+    Serial.println("⚠️ Falló la configuración de parámetros");
+  }
+
+  // Re-leer para confirmar
+  delay(500);
+  ld2410s.readCommonParametersCommand(farDist, nearDist, delayT, freqSt, freqDist, respTime);
+  Serial.printf("Nuevos parámetros -> Delay: %d s | Response: %d\n", delayT, respTime);
+
+  // Inicializar ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error ESP-NOW");
+    while (true);
+  }
+  esp_now_register_send_cb(OnDataSent);
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, MAC_MASTER, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  esp_now_add_peer(&peerInfo);
+
+  Serial.println("Nodo1 listo - GPIO luces: " + String(OUTPUT_PIN));
+}
+
+void loop() {
+  ld2410s.loop();
+
+  int distancia = ld2410s.getDistance();
+  bool motion = ld2410s.isMotionDetected();
+
+  bool presenciaActual = motion && (distancia > 0 && distancia <= 80);  // aumentamos un poco el rango
+
+  if (presenciaActual) {
+    lastPresenceTime = millis();
+  }
+
+  bool presenciaConHold = presenciaActual || (millis() - lastPresenceTime < PRESENCE_HOLD_TIME);
+
+  // Control del relé/LED
+  digitalWrite(OUTPUT_PIN, presenciaConHold ? HIGH : LOW);
+
+  // Envío por ESP-NOW solo cuando cambia o pasa tiempo
+  bool cambio = (presenciaConHold != previousPresencia) || (abs(distancia - previousDistancia) >= 8);
+
+  unsigned long now = millis();
+  if (cambio || (now - lastSendTime >= SEND_INTERVAL)) {
+    myData.id = 1;
+    myData.presencia = presenciaConHold;
+    myData.distancia = distancia;
+
+    esp_now_send(MAC_MASTER, (uint8_t*)&myData, sizeof(myData));
+
+    Serial.printf("→ Master | Luces: %s | Dist: %d cm | Motion: %s\n",
+                  presenciaConHold ? "ON" : "OFF", distancia, motion ? "YES" : "NO");
+
+    lastSendTime = now;
+    previousPresencia = presenciaConHold;
+    previousDistancia = distancia;
+  }
+
+  delay(60);   // loop rápido para mejor actualización
+}
