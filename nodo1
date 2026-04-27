@@ -1,0 +1,110 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include "HLK-LD2410S.h"
+
+// ====== Configuración ======
+const uint8_t MAC_MASTER[] = {0xB0, 0xCB, 0xD8, 0xC2, 0x42, 0x80}; // MAC del master
+
+constexpr int RX_PIN = 16;
+constexpr int TX_PIN = 17;
+
+LD2410S ld2410s(Serial1, RX_PIN, TX_PIN);
+
+typedef struct struct_message {
+  int id;
+  bool presencia;
+  int distancia;      // en cm
+} struct_message;
+
+struct_message myData;
+
+// Variables para debounce y hold de presencia
+unsigned long lastSendTime = 0;
+unsigned long lastPresenceTime = 0;
+const unsigned long SEND_INTERVAL = 500;           // enviar cada 500ms como mínimo
+const unsigned long PRESENCE_HOLD_TIME = 8000;     // mantener "presencia" 8 segundos después de perderla (ajusta según necesites)
+
+bool previousPresencia = false;
+int previousDistancia = -1;
+
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  Serial.print("Estado del envío: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Éxito" : "Fallo");
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n=== NODO1 ESP-NOW + HLK-LD2410S (optimizado) ===");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+
+  ld2410s.begin();
+  delay(1000);                    // tiempo para que el sensor se estabilice
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error iniciando ESP-NOW");
+    while (true);
+  }
+
+  esp_now_register_send_cb(OnDataSent);
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, MAC_MASTER, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Error agregando peer master");
+    while (true);
+  }
+
+  Serial.println("Nodo1 listo.");
+}
+
+void loop() {
+  ld2410s.loop();                    // ¡Siempre necesario!
+
+  int distancia = ld2410s.getDistance();
+  bool motionDetected = ld2410s.isMotionDetected();
+
+  // Lógica mejorada de presencia (basada solo en lo que ofrece la librería)
+  bool presenciaActual = motionDetected && (distancia > 0 && distancia <= 50);
+
+  // Hold time: si había presencia recientemente, la mantenemos un poco más
+  if (presenciaActual) {
+    lastPresenceTime = millis();
+  }
+
+  bool presenciaConHold = presenciaActual || (millis() - lastPresenceTime < PRESENCE_HOLD_TIME);
+
+  // Solo actualizamos y enviamos si hay cambio significativo o ha pasado el intervalo
+  bool hayCambio = (presenciaConHold != previousPresencia) || 
+                   (abs(distancia - previousDistancia) > 5);  // cambio > 5 cm
+
+  unsigned long now = millis();
+  if ((hayCambio || (now - lastSendTime >= SEND_INTERVAL)) && (now - lastSendTime >= 300)) {
+    
+    myData.id = 1;
+    myData.presencia = presenciaConHold;
+    myData.distancia = distancia;
+
+    esp_err_t result = esp_now_send(MAC_MASTER, (uint8_t *)&myData, sizeof(myData));
+
+    if (result == ESP_OK) {
+      Serial.printf("Nodo1 -> Master | Presencia: %s | Dist: %d cm | Motion: %s\n",
+                    presenciaConHold ? "SÍ" : "NO",
+                    distancia,
+                    motionDetected ? "YES" : "NO");
+    } else {
+      Serial.println("Error enviando mensaje ESP-NOW");
+    }
+
+    lastSendTime = now;
+    previousPresencia = presenciaConHold;
+    previousDistancia = distancia;
+  }
+
+  delay(100);   // loop más rápido para leer mejor el sensor (la librería lo necesita)
+}
